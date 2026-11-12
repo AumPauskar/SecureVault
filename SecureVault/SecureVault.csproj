@@ -70,7 +70,7 @@
 
     <!-- When publishing trimmed, make sure to treat trimming warnings as build errors -->
     <ILLinkTreatWarningsAsErrors>true</ILLinkTreatWarningsAsErrors>
-    <DefaultLanguage>English</DefaultLanguage>
+    <DefaultLanguage>en-us</DefaultLanguage>
 
   </PropertyGroup>
 
