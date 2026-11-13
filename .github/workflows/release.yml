@@ -1,0 +1,144 @@
+name: Build and release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Release version (for example, 1.0.0.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Set up MSBuild
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Validate release version
+        shell: pwsh
+        env:
+          VERSION_INPUT: ${{ inputs.version }}
+        run: |
+          if ($env:VERSION_INPUT -notmatch '^\d+\.\d+\.\d+\.\d+$') {
+            throw "Version must have four numeric components, for example 1.0.0.0."
+          }
+
+          "RELEASE_VERSION=$env:VERSION_INPUT" >> $env:GITHUB_ENV
+          "RELEASE_TAG=v$env:VERSION_INPUT" >> $env:GITHUB_ENV
+
+          $manifestPath = "SecureVault\Package.appxmanifest"
+          [xml]$manifest = Get-Content -Path $manifestPath -Raw
+          $namespaceManager = New-Object System.Xml.XmlNamespaceManager($manifest.NameTable)
+          $namespaceManager.AddNamespace("appx", "http://schemas.microsoft.com/appx/manifest/foundation/windows10")
+          $identity = $manifest.SelectSingleNode("/appx:Package/appx:Identity", $namespaceManager)
+          if ($null -eq $identity) {
+            throw "Could not find the package identity in $manifestPath."
+          }
+          $identity.SetAttribute("Version", $env:VERSION_INPUT)
+          $manifest.Save((Resolve-Path $manifestPath).Path)
+
+      - name: Prepare signing certificate
+        shell: pwsh
+        env:
+          WINDOWS_SIGNING_CERTIFICATE_BASE64: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_BASE64 }}
+          WINDOWS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERTIFICATE_PASSWORD }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:WINDOWS_SIGNING_CERTIFICATE_BASE64) -or
+              [string]::IsNullOrEmpty($env:WINDOWS_SIGNING_CERTIFICATE_PASSWORD)) {
+            throw "Configure the WINDOWS_SIGNING_CERTIFICATE_BASE64 and WINDOWS_SIGNING_CERTIFICATE_PASSWORD repository secrets."
+          }
+
+          $certificatePath = Join-Path $env:RUNNER_TEMP "SecureVaultSigning.pfx"
+          $certificateBytes = [Convert]::FromBase64String($env:WINDOWS_SIGNING_CERTIFICATE_BASE64)
+          [IO.File]::WriteAllBytes($certificatePath, $certificateBytes)
+
+          $securePassword = ConvertTo-SecureString $env:WINDOWS_SIGNING_CERTIFICATE_PASSWORD -AsPlainText -Force
+          $certificates = @(Import-PfxCertificate -FilePath $certificatePath -CertStoreLocation Cert:\CurrentUser\My -Password $securePassword)
+          $signingCertificate = $certificates | Where-Object { $_.HasPrivateKey } | Select-Object -First 1
+          if ($null -eq $signingCertificate -or $signingCertificate.Subject -ne "CN=SecureVault") {
+            throw "The signing PFX must contain a private-key certificate whose subject is CN=SecureVault."
+          }
+
+          $assetDirectory = Join-Path $env:RUNNER_TEMP "release-assets"
+          New-Item -ItemType Directory -Path $assetDirectory -Force | Out-Null
+          Export-Certificate -Cert $signingCertificate -FilePath (Join-Path $assetDirectory "SecureVaultSigning.cer") | Out-Null
+
+          "SIGNING_CERTIFICATE_THUMBPRINT=$($signingCertificate.Thumbprint)" >> $env:GITHUB_ENV
+          "RELEASE_ASSET_DIRECTORY=$assetDirectory" >> $env:GITHUB_ENV
+
+      - name: Build and sign MSIX packages
+        shell: pwsh
+        run: |
+          foreach ($platform in @("x64", "ARM64")) {
+            $packageDirectory = Join-Path $env:RUNNER_TEMP "packages\$platform"
+            New-Item -ItemType Directory -Path $packageDirectory -Force | Out-Null
+            $packageDirectory = $packageDirectory.TrimEnd('\') + '\'
+
+            $msbuildArgs = @(
+              "SecureVault\SecureVault.csproj",
+              "/restore",
+              "/m",
+              "/p:Configuration=Release",
+              "/p:Platform=$platform",
+              "/p:GenerateAppxPackageOnBuild=true",
+              "/p:AppxPackageSigningEnabled=true",
+              "/p:PackageCertificateThumbprint=$env:SIGNING_CERTIFICATE_THUMBPRINT",
+              "/p:AppxPackageDir=$packageDirectory",
+              "/p:AppxBundle=Never",
+              "/p:UapAppxPackageBuildMode=SideloadOnly"
+            )
+
+            & msbuild @msbuildArgs
+            if ($LASTEXITCODE -ne 0) {
+              throw "MSBuild failed for $platform with exit code $LASTEXITCODE."
+            }
+
+            $package = Get-ChildItem -Path $packageDirectory -Filter "SecureVault_*.msix" -Recurse |
+              Select-Object -First 1
+            if ($null -eq $package) {
+              throw "No SecureVault MSIX package was produced for $platform."
+            }
+            $signature = Get-AuthenticodeSignature -FilePath $package.FullName
+            if ($null -eq $signature.SignerCertificate -or
+                $signature.SignerCertificate.Thumbprint -ne $env:SIGNING_CERTIFICATE_THUMBPRINT) {
+              throw "The $platform package is not signed with the configured certificate."
+            }
+
+            $assetName = "SecureVault_$($env:RELEASE_VERSION)_$platform.msix"
+            Copy-Item -Path $package.FullName -Destination (Join-Path $env:RELEASE_ASSET_DIRECTORY $assetName)
+          }
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $assets = Get-ChildItem -Path $env:RELEASE_ASSET_DIRECTORY -File |
+            ForEach-Object { $_.FullName }
+          if ($assets.Count -lt 3) {
+            throw "Expected two MSIX packages and the public signing certificate."
+          }
+
+          $ghArgs = @(
+            "release", "create", $env:RELEASE_TAG,
+            "--target", $env:GITHUB_SHA,
+            "--title", "SecureVault $env:RELEASE_VERSION",
+            "--generate-notes"
+          ) + $assets
+
+          & gh @ghArgs
+          if ($LASTEXITCODE -ne 0) {
+            throw "GitHub release creation failed with exit code $LASTEXITCODE."
+          }
