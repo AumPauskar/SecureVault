@@ -92,6 +92,7 @@ jobs:
               "/m",
               "/p:Configuration=Release",
               "/p:Platform=$platform",
+              "/p:RuntimeIdentifier=win-$($platform.ToLowerInvariant())",
               "/p:GenerateAppxPackageOnBuild=true",
               "/p:AppxPackageSigningEnabled=true",
               "/p:PackageCertificateThumbprint=$env:SIGNING_CERTIFICATE_THUMBPRINT",
